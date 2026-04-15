@@ -1,6 +1,5 @@
-# Python artifacts
+data/
+*.json
 __pycache__/
 *.pyc
-
-# Data files
-data/model/
+ai-venv/
