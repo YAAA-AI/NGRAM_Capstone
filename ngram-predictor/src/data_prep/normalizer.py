@@ -1,19 +1,25 @@
-"""Normalizer module for ngram-predictor."""
-
+from __future__ import annotations
 
 import re
+from dataclasses import dataclass
+from typing import List
 
 
+@dataclass(frozen=True)
 class Normalizer:
-    """Handle token normalization for training and inference."""
+    """Normalize raw text into tokens (words)."""
 
-    def normalize(self, text: str) -> str:
-        """Convert text to lowercase, remove punctuation, and split into words.
+    lowercase: bool = True
+    keep_apostrophes: bool = False
 
-        Args:
-            text: Raw input text string.
+    def normalize(self, text: str) -> List[str]:
+        if self.lowercase:
+            text = text.lower()
 
-        Returns:
-            A list of lowercase word strings.
-        """
-        return re.sub(r'[^\w\s]', ' ', text.lower()).split()
+        if self.keep_apostrophes:
+            # Keep apostrophes inside words (e.g., don't -> don't)
+            text = re.sub(r"[^\w\s']", " ", text)
+        else:
+            text = re.sub(r"[^\w\s]", " ", text)
+
+        return text.split()

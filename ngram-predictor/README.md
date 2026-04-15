@@ -20,9 +20,15 @@ This application uses n-gram language modeling to predict the next word based on
 - **Persistent Results**: Evaluation results persist across reruns until a new evaluation is triggered
 - **Smart Spacing**: Automatically handles spacing when inserting predicted words
 
+## Python Version
+If using Python 3.14, this version is not fully released for a NumPy build compiled with MinGW. App might crash. 
+Please run these two commands after installing the libraries from the requirements.txt file. 
+- pip uninstall numpy -y
+- pip install --only-binary=:all: numpy
+
 ## Requirements
 
-- Python 3.x
+- Python 3.14 --
 - `streamlit`
 - `streamlit-keyup`
 - `beautifulsoup4`
