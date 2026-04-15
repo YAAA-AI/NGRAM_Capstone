@@ -1,131 +1,179 @@
 from __future__ import annotations
 
-import sys
 import argparse
-import subprocess
+import os
+import sys
 from pathlib import Path
+
+try:
+    from dotenv import load_dotenv
+except Exception:
+    def load_dotenv(dotenv_path: str | Path | None = None) -> bool:
+        """Fallback dotenv loader when python-dotenv is unavailable."""
+        if dotenv_path is None:
+            return False
+
+        path = Path(dotenv_path)
+        if not path.exists():
+            return False
+
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip()
+            if key and key not in os.environ:
+                os.environ[key] = value
+        return True
 
 
 ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-
-def load_config() -> dict:
-    """Load config from config/.env (simple key=value)."""
-    cfg = {"SMOOTHING": "none"}
-    env_path = ROOT / "config" / ".env"
-    if env_path.exists():
-        for line in env_path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            k, _, v = line.partition("=")
-            cfg[k.strip()] = v.strip()
-    return cfg
+DATA_DIR = ROOT / "data" / "processed"
+TRAIN_TOKENS_PATH = DATA_DIR / "train_tokens.txt"
+MODEL_PATH = DATA_DIR / "model.json"
+VOCAB_PATH = DATA_DIR / "vocab.json"
 
 
-def is_running_under_streamlit() -> bool:
-    return any("streamlit" in m for m in sys.modules)
+def _int_env(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
 
 
-def cmd_ui(_args) -> None:
-    """UI command.
+def _csv_int_env(name: str, default: list[int]) -> list[int]:
+    raw = os.getenv(name)
+    if not raw:
+        return default
 
-    Preferred:
-        streamlit run main.py -- ui
+    out: list[int] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            out.append(int(part))
+        except ValueError:
+            continue
+    return out or default
 
-    Convenience:
-        python main.py ui
-    """
-    if not is_running_under_streamlit():
-        subprocess.run(
-            [sys.executable, "-m", "streamlit", "run", str(ROOT / "main.py"), "--", "ui"],
-            check=True,
-        )
+
+def step_dataprep() -> None:
+    from src.data_prep.normalizer import Normalizer, prepare_training_tokens
+
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    normalizer = Normalizer()
+    train_book_ids = _csv_int_env("TRAIN_BOOK_IDS", [1661, 834, 108, 2852])
+    tokens = prepare_training_tokens(TRAIN_TOKENS_PATH, normalizer=normalizer, book_ids=train_book_ids)
+    print(f"Dataprep complete. Wrote {len(tokens)} tokens to {TRAIN_TOKENS_PATH}")
+
+
+def step_model() -> None:
+    from src.data_prep.normalizer import load_tokens
+    from src.model.ngram_model import NGramModel
+
+    if not TRAIN_TOKENS_PATH.exists():
+        raise FileNotFoundError(f"Missing training tokens file: {TRAIN_TOKENS_PATH}")
+
+    tokens = load_tokens(TRAIN_TOKENS_PATH)
+    if not tokens:
+        raise ValueError(f"No tokens found in: {TRAIN_TOKENS_PATH}")
+
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    max_n = _int_env("MAX_N", 4)
+    model = NGramModel.from_word_lists([tokens], max_n=max_n)
+    model.save(MODEL_PATH, VOCAB_PATH)
+    print(f"Model complete. Saved model to {MODEL_PATH} and vocab to {VOCAB_PATH}")
+
+
+def step_inference() -> None:
+    from src.data_prep.normalizer import Normalizer
+    from src.inference.predictor import Predictor
+    from src.model.ngram_model import NGramModel
+
+    if not MODEL_PATH.exists():
+        raise FileNotFoundError(f"Missing model file: {MODEL_PATH}")
+
+    normalizer = Normalizer()
+    model = NGramModel.load(MODEL_PATH, VOCAB_PATH, normalizer=normalizer)
+    predictor = Predictor(
+        model=model,
+        smoothing=os.getenv("SMOOTHING", "none"),
+        top_k=_int_env("TOP_K", 3),
+    )
+
+    print("Interactive inference started. Type 'quit' to exit.")
+    while True:
+        try:
+            text = input("> ").strip()
+        except KeyboardInterrupt:
+            print("\nGoodbye.")
+            break
+
+        if text.lower() == "quit":
+            print("Goodbye.")
+            break
+
+        predictions = predictor.predict_next(text, predictor.top_k)
+        print(f"Predictions: {predictions}")
+
+
+def run_step(step: str) -> None:
+    if step == "dataprep":
+        step_dataprep()
+        return
+    if step == "model":
+        step_model()
+        return
+    if step == "inference":
+        step_inference()
+        return
+    if step == "all":
+        step_dataprep()
+        step_model()
+        step_inference()
         return
 
-    from src.ui.app import run_app
-    cfg = load_config()
-    run_app(cfg)
-
-
-def cmd_build(args) -> None:
-    from src.model.ngram_model import NGramModel
-
-    book_ids = [int(x) for x in args.book_ids]
-    model = NGramModel.from_gutenberg_ids(book_ids, max_n=args.max_n, progress_cb=print)
-    print(f"Built model with vocab size: {model.vocab_size}")
-
-
-def cmd_predict(args) -> None:
-    from src.model.ngram_model import NGramModel
-    from src.inference.predictor import Predictor
-
-    cfg = load_config()
-    book_ids = [int(x) for x in args.book_ids]
-    model = NGramModel.from_gutenberg_ids(book_ids, max_n=args.max_n, progress_cb=print)
-
-    smoothing = args.smoothing or cfg.get("SMOOTHING", "none")
-    predictor = Predictor(model=model, smoothing=smoothing, top_k=args.top_k)
-
-    print("Type text (Ctrl+C to exit):")
-    while True:
-        text = input("> ")
-        print(predictor.suggest(text))
-
-
-def cmd_evaluate(args) -> None:
-    from src.model.ngram_model import NGramModel
-    from src.evaluation.evaluator import Evaluator
-
-    cfg = load_config()
-    train_ids = [int(x) for x in args.train_ids]
-    model = NGramModel.from_gutenberg_ids(train_ids, max_n=args.max_n, progress_cb=print)
-
-    evaluator = Evaluator(model=model)
-    smoothing = args.smoothing or cfg.get("SMOOTHING", "none")
-    res = evaluator.evaluate_gutenberg_book(int(args.eval_book_id), smoothing=smoothing)
-    print(res)
+    raise ValueError(f"Unknown step: {step}")
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        prog="ngram-predictor",
-        description="N-gram predictor (single entry point for CLI + Streamlit UI).",
+    parser = argparse.ArgumentParser(prog="main.py", description="N-gram predictor CLI pipeline")
+    parser.add_argument(
+        "--step",
+        type=str,
+        required=True,
+        choices=["dataprep", "model", "inference", "all"],
+        help="Which pipeline step to run.",
     )
-    sub = parser.add_subparsers(dest="cmd", required=True)
-
-    p_ui = sub.add_parser("ui", help="Run Streamlit UI (use: streamlit run main.py -- ui)")
-    p_ui.set_defaults(func=cmd_ui)
-
-    p_build = sub.add_parser("build", help="Build model from Gutenberg book ids.")
-    p_build.add_argument("--book-ids", nargs="+", required=True)
-    p_build.add_argument("--max-n", type=int, default=4)
-    p_build.set_defaults(func=cmd_build)
-
-    p_pred = sub.add_parser("predict", help="Interactive CLI prediction.")
-    p_pred.add_argument("--book-ids", nargs="+", required=True)
-    p_pred.add_argument("--max-n", type=int, default=4)
-    p_pred.add_argument("--top-k", type=int, default=5)
-    p_pred.add_argument("--smoothing", type=str, default=None, choices=["none", "mle-backoff"])
-    p_pred.set_defaults(func=cmd_predict)
-
-    p_eval = sub.add_parser("evaluate", help="Evaluate perplexity on a Gutenberg book id.")
-    p_eval.add_argument("--train-ids", nargs="+", required=True)
-    p_eval.add_argument("--eval-book-id", required=True)
-    p_eval.add_argument("--max-n", type=int, default=4)
-    p_eval.add_argument("--smoothing", type=str, default=None, choices=["none", "mle-backoff"])
-    p_eval.set_defaults(func=cmd_evaluate)
-
     return parser
 
 
-def main():
-    parser = build_parser()
-    args = parser.parse_args()
-    args.func(args)
+def is_running_under_streamlit() -> bool:
+    return any("streamlit" in module_name for module_name in sys.modules) or bool(os.getenv("STREAMLIT_SERVER_PORT"))
 
+
+def run_streamlit_app() -> None:
+    from src.ui.app import run_app
+
+    cfg = {"SMOOTHING": os.getenv("SMOOTHING", "none")}
+    run_app(cfg)
+
+
+def main() -> None:
+    load_dotenv(ROOT / "config" / ".env")
+
+    if is_running_under_streamlit():
+        run_streamlit_app()
+        return
+
+    args = build_parser().parse_args()
+    run_step(args.step)
 
 if __name__ == "__main__":
     main()

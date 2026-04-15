@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 import math
 import ssl
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 from collections import Counter, defaultdict
 from time import sleep
@@ -158,6 +160,67 @@ class NGramModel:
             if len(current) >= top_k:
                 break
         return current
+
+    def save(self, model_path: str | Path, vocab_path: str | Path) -> None:
+        model_path = Path(model_path)
+        vocab_path = Path(vocab_path)
+        model_path.parent.mkdir(parents=True, exist_ok=True)
+        vocab_path.parent.mkdir(parents=True, exist_ok=True)
+
+        serialized_indices: List[Dict[str, List[List[object]]]] = []
+        for ctx_index in self.context_indices:
+            serial_map: Dict[str, List[List[object]]] = {}
+            for ctx, candidates in ctx_index.items():
+                ctx_key = "\t".join(ctx)
+                serial_map[ctx_key] = [[word, int(count)] for word, count in candidates]
+            serialized_indices.append(serial_map)
+
+        model_payload = {
+            "max_n": len(self.context_indices) + 1,
+            "context_indices": serialized_indices,
+            "unigram_probs": self.unigram_probs,
+        }
+        vocab_payload = {
+            "vocab": sorted(self.unigram_probs.keys()),
+            "vocab_size": self.vocab_size,
+        }
+
+        model_path.write_text(json.dumps(model_payload, ensure_ascii=True, indent=2), encoding="utf-8")
+        vocab_path.write_text(json.dumps(vocab_payload, ensure_ascii=True, indent=2), encoding="utf-8")
+
+    @classmethod
+    def load(
+        cls,
+        model_path: str | Path,
+        vocab_path: str | Path | None = None,
+        normalizer: Optional[Normalizer] = None,
+    ) -> "NGramModel":
+        model_path = Path(model_path)
+        payload = json.loads(model_path.read_text(encoding="utf-8"))
+
+        context_indices: List[Dict[Context, List[Tuple[str, int]]]] = []
+        for serial_map in payload.get("context_indices", []):
+            restored: Dict[Context, List[Tuple[str, int]]] = {}
+            for ctx_key, candidates in serial_map.items():
+                ctx = tuple(filter(None, ctx_key.split("\t")))
+                restored[ctx] = [(str(word), int(count)) for word, count in candidates]
+            context_indices.append(restored)
+
+        unigram_probs = {str(k): float(v) for k, v in payload.get("unigram_probs", {}).items()}
+        vocab_size = len(unigram_probs)
+
+        if vocab_path is not None:
+            vp = Path(vocab_path)
+            if vp.exists():
+                vocab_payload = json.loads(vp.read_text(encoding="utf-8"))
+                vocab_size = int(vocab_payload.get("vocab_size", vocab_size))
+
+        return cls(
+            context_indices=context_indices,
+            unigram_probs=unigram_probs,
+            vocab_size=vocab_size,
+            normalizer=normalizer or Normalizer(),
+        )
 
     def evaluate(self, eval_words: List[str], use_unigram_fallback: bool = False) -> Tuple[float, int, int]:
         """Return (perplexity, evaluated_count, skipped_count)."""

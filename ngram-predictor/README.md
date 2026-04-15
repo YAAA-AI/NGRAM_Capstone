@@ -21,23 +21,22 @@ This application uses n-gram language modeling to predict the next word based on
 - **Smart Spacing**: Automatically handles spacing when inserting predicted words
 
 ## Python Version
-If using Python 3.14, this version is not fully released for a NumPy build compiled with MinGW. App might crash. 
-Please run these two commands after installing the libraries from the requirements.txt file. 
-- pip uninstall numpy -y
-- pip install --only-binary=:all: numpy
+If using Python 3.14, NumPy may not build correctly with MinGW. If the app crashes after install, run:
+
+```bash
+pip uninstall numpy -y
+pip install --only-binary=:all: numpy
+```
 
 ## Requirements
 
-- Python 3.14 --
-- `streamlit`
-- `streamlit-keyup`
-- `beautifulsoup4`
-- `requests`
+- Python 3.14+
+- See `requirements.txt` for the full dependency list.
 
 Install dependencies:
 
 ```bash
-pip install streamlit streamlit-keyup beautifulsoup4 requests
+pip install -r requirements.txt
 ```
 
 ## Usage
@@ -45,7 +44,7 @@ pip install streamlit streamlit-keyup beautifulsoup4 requests
 Run the app:
 
 ```bash
-streamlit run N-gram_streamlit.py
+streamlit run main.py
 ```
 
 ### Step 1: Configure and Load Books
@@ -150,18 +149,25 @@ streamlit run N-gram_streamlit.py
 
 ## CLI Usage
 
-A command-line interface is also available via `main.py`:
+`main.py` accepts a `--step` argument that controls which part of the pipeline to run. Steps must be run in order (`dataprep` → `model` → `inference`) unless you use `all`.
 
-```bash
-# Evaluate with default settings
-python main.py --step evaluate
+| Command | What it runs |
+|---|---|
+| `python main.py --step dataprep` | Run `Normalizer` — produce `train_tokens.txt` |
+| `python main.py --step model` | Run `NGramModel` — produce `model.json` and `vocab.json` |
+| `python main.py --step inference` | Start the interactive CLI prediction loop |
+| `python main.py --step all` | Run dataprep → model → inference in sequence |
 
-# Evaluate with a custom corpus
-python main.py --step evaluate --eval-file path/to/corpus.txt
+Environment variables are loaded from `config/.env` before any step runs.
 
-# Download the default evaluation corpus
-python main.py --step download_eval
-```
+| Variable | Description | Default |
+|---|---|---|
+| `SMOOTHING` | `none` or `mle-backoff` | `none` |
+| `TOP_K` | Predictions shown per prompt in CLI inference | `3` |
+| `MAX_N` | Max n-gram order for the model step | `4` |
+| `TRAIN_BOOK_IDS` | Comma-separated Gutenberg IDs for dataprep | `1661,834,108,2852` |
+
+`main.py` is also the Streamlit entrypoint — `streamlit run main.py` launches the full UI without requiring `--step`.
 
 ## Default Book IDs
 
