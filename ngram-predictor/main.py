@@ -35,9 +35,9 @@ def load_config():
     directory. Lines starting with '#' and blank lines are ignored.
 
     Returns:
-        A dict with configuration values. Defaults to SMOOTHING='none'.
+        A dict with configuration values. Defaults to SMOOTHING='mle-backoff'.
     """
-    config = {"SMOOTHING": "none"}
+    config = {"SMOOTHING": "mle-backoff"}
     env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config", ".env")
     if os.path.exists(env_path):
         with open(env_path) as f:
@@ -276,7 +276,7 @@ class NgramModel:
 
         return cls.from_word_lists(word_lists, max_n=max_n, progress_placeholder=progress_placeholder)
 
-    def predict(self, user_input, top_k=5, use_unigram_fallback=False):
+    def predict(self, user_input, top_k=5, use_unigram_fallback=False, smoothing="mle-backoff"):
         """Predict the most likely next words given user input text.
 
         Uses backoff from highest to lowest n-gram order. If no context
@@ -288,6 +288,7 @@ class NgramModel:
             top_k: Number of top predictions to return.
             use_unigram_fallback: Whether to fall back to unigram
                 probabilities when no n-gram context matches.
+            smoothing: Smoothing method ('mle-backoff' or 'katz').
 
         Returns:
             A list of up to top_k predicted next words.
@@ -296,6 +297,9 @@ class NgramModel:
         words = normalize_text(user_input)[-num:]
         if not words:
             return []
+
+        if smoothing == "katz":
+            return self._predict_katz(words, top_k)
 
         for j, context_index in enumerate(self.context_indices):
             context_len = min(len(words), num - j)
@@ -319,7 +323,7 @@ class NgramModel:
 
         return []
 
-    def evaluate(self, eval_words, use_unigram_fallback=False):
+    def evaluate(self, eval_words, use_unigram_fallback=False, smoothing="mle-backoff"):
         """Compute perplexity of the model on an evaluation word list.
 
         Pre-builds O(1) lookup tables from context indices, then scores
@@ -329,10 +333,14 @@ class NgramModel:
             eval_words: List of words from the evaluation corpus.
             use_unigram_fallback: Whether to use unigram probabilities
                 for words not found in any higher-order context.
+            smoothing: Smoothing method ('mle-backoff' or 'katz').
 
         Returns:
             A tuple of (perplexity, evaluated_count, skipped_count).
         """
+        if smoothing == "katz":
+            return self._evaluate_katz(eval_words)
+
         num = len(self.context_indices)
         ctx_lengths = [num - j for j in range(num)]
         n_words = len(eval_words)
@@ -372,6 +380,177 @@ class NgramModel:
                         found = True
                 if not found:
                     skipped += 1
+
+        if evaluated == 0:
+            return float('inf'), 0, skipped
+
+        cross_entropy = -total_log_prob / evaluated
+        perplexity = 2 ** cross_entropy
+        return perplexity, evaluated, skipped
+
+    def _build_katz_tables(self, k=5):
+        """Precompute Katz backoff discount probabilities and alpha weights.
+
+        Uses Good-Turing discounting for counts <= k and no discounting
+        for counts > k. Builds tables from lowest to highest n-gram order
+        so that backoff probabilities are available during construction.
+
+        Args:
+            k: Discount threshold. Counts above k are not discounted.
+        """
+        num = len(self.context_indices)
+        self._katz_disc_probs = [None] * num
+        self._katz_alphas = [None] * num
+
+        for idx in range(num - 1, -1, -1):
+            ctx_index = self.context_indices[idx]
+
+            all_counts = []
+            for candidates in ctx_index.values():
+                for _, count in candidates:
+                    all_counts.append(count)
+            freq_of_freq = Counter(all_counts)
+            n1 = freq_of_freq.get(1, 0)
+            nk1 = freq_of_freq.get(k + 1, 0)
+
+            def _discount(r, _ff=freq_of_freq, _n1=n1, _nk1=nk1, _k=k):
+                if r == 0:
+                    return 0.0
+                if r > _k:
+                    return 1.0
+                nr = _ff.get(r, 0)
+                nr1 = _ff.get(r + 1, 0)
+                if nr == 0 or _n1 == 0:
+                    return 1.0
+                raw = (r + 1) * nr1 / (r * nr)
+                kterm = (_k + 1) * _nk1 / _n1
+                denom = 1.0 - kterm
+                if abs(denom) < 1e-10:
+                    return 1.0
+                d = (raw - kterm) / denom
+                return max(0.0, min(1.0, d))
+
+            disc_probs = {}
+            alphas = {}
+
+            for ctx, candidates in ctx_index.items():
+                total = sum(c for _, c in candidates)
+                probs = {}
+                seen_mass = 0.0
+                backoff_seen_mass = 0.0
+
+                for word, count in candidates:
+                    d = _discount(count)
+                    p = d * count / total
+                    probs[word] = p
+                    seen_mass += p
+
+                    shorter = ctx[1:] if len(ctx) > 0 else ()
+                    bp = self._katz_lower_prob(word, shorter, idx + 1)
+                    backoff_seen_mass += bp
+
+                disc_probs[ctx] = probs
+
+                if backoff_seen_mass < 1.0 - 1e-10:
+                    alphas[ctx] = max(0.0, (1.0 - seen_mass) / (1.0 - backoff_seen_mass))
+                else:
+                    alphas[ctx] = 0.0
+
+            self._katz_disc_probs[idx] = disc_probs
+            self._katz_alphas[idx] = alphas
+
+    def _katz_lower_prob(self, word, context, order_idx):
+        """Compute Katz backoff probability recursively.
+
+        Args:
+            word: The target word.
+            context: Tuple of context words.
+            order_idx: Index into self.context_indices to start from.
+
+        Returns:
+            The Katz backoff probability of word given context.
+        """
+        num = len(self.context_indices)
+        if order_idx >= num:
+            return self.unigram_probs.get(word, 1.0 / (self.vocab_size + 1))
+
+        disc_probs = self._katz_disc_probs[order_idx]
+        if disc_probs is not None and context in disc_probs:
+            if word in disc_probs[context]:
+                return disc_probs[context][word]
+            else:
+                alpha = self._katz_alphas[order_idx].get(context, 0.0)
+                shorter = context[1:] if len(context) > 0 else ()
+                return alpha * self._katz_lower_prob(word, shorter, order_idx + 1)
+        else:
+            shorter = context[1:] if len(context) > 0 else ()
+            return self._katz_lower_prob(word, shorter, order_idx + 1)
+
+    def _predict_katz(self, words, top_k=5):
+        """Predict next words using Katz backoff smoothing.
+
+        Args:
+            words: Normalized input words (already trimmed to context size).
+            top_k: Number of top predictions to return.
+
+        Returns:
+            A list of up to top_k predicted next words.
+        """
+        if not hasattr(self, '_katz_disc_probs'):
+            self._build_katz_tables()
+
+        num = len(self.context_indices)
+        for j in range(num):
+            context_len = min(len(words), num - j)
+            context = tuple(words[-context_len:]) if context_len > 0 else ()
+            if context in self._katz_disc_probs[j]:
+                seen = self._katz_disc_probs[j][context]
+                results = sorted(seen.keys(), key=seen.get, reverse=True)[:top_k]
+                if len(results) < top_k:
+                    alpha = self._katz_alphas[j].get(context, 0.0)
+                    if alpha > 0:
+                        seen_set = set(results)
+                        ranked = sorted(self.unigram_probs, key=self.unigram_probs.get, reverse=True)
+                        for w in ranked:
+                            if w not in seen_set:
+                                results.append(w)
+                                seen_set.add(w)
+                                if len(results) >= top_k:
+                                    break
+                return results
+
+        ranked = sorted(self.unigram_probs, key=self.unigram_probs.get, reverse=True)
+        return ranked[:top_k]
+
+    def _evaluate_katz(self, eval_words):
+        """Compute perplexity using Katz backoff smoothing.
+
+        Args:
+            eval_words: List of words from the evaluation corpus.
+
+        Returns:
+            A tuple of (perplexity, evaluated_count, skipped_count).
+        """
+        if not hasattr(self, '_katz_disc_probs'):
+            self._build_katz_tables()
+
+        num = len(self.context_indices)
+        n_words = len(eval_words)
+        total_log_prob = 0.0
+        evaluated = 0
+        skipped = 0
+
+        for i in range(1, n_words):
+            word = eval_words[i]
+            context_len = min(i, num)
+            context = tuple(eval_words[i - context_len:i])
+            start_idx = num - context_len
+            prob = self._katz_lower_prob(word, context, start_idx)
+            if prob > 0:
+                total_log_prob += math.log2(prob)
+                evaluated += 1
+            else:
+                skipped += 1
 
         if evaluated == 0:
             return float('inf'), 0, skipped
@@ -435,15 +614,15 @@ if load_btn:
 
 # Smoothing (shown after model is built)
 if "model" in st.session_state:
-    smoothing_options = ["none", "mle-backoff"]
+    smoothing_options = ["mle-backoff", "katz"]
     default_idx = smoothing_options.index(config["SMOOTHING"]) if config["SMOOTHING"] in smoothing_options else 0
     smoothing = st.selectbox("Smoothing Method", smoothing_options, index=default_idx,
-                             format_func=lambda x: {"none": "None",
-                                                     "mle-backoff": "MLE Backoff"}[x],
+                             format_func=lambda x: {"mle-backoff": "None",
+                                                     "katz": "Katz Backoff"}[x],
                              help="Applied to both evaluation and predictions")
     st.session_state["smoothing"] = smoothing
 else:
-    st.session_state["smoothing"] = config.get("SMOOTHING", "none")
+    st.session_state["smoothing"] = config.get("SMOOTHING", "mle-backoff")
 
 # --- Evaluator ---
 st.divider()
@@ -465,7 +644,7 @@ def evaluation_section():
 
     if eval_btn and "model" in st.session_state:
         eval_url = f"https://www.gutenberg.org/cache/epub/{eval_book_id}/pg{eval_book_id}-images.html"
-        cur_smoothing = st.session_state.get("smoothing", "none")
+        cur_smoothing = st.session_state.get("smoothing", "mle-backoff")
         use_fallback = cur_smoothing == "mle-backoff"
         with st.spinner(f"Evaluating with '{cur_smoothing}' smoothing on book {eval_book_id}..."):
             try:
@@ -477,7 +656,7 @@ def evaluation_section():
                     st.session_state["eval_results"] = {"error": "Evaluation book is empty."}
                 else:
                     perplexity, evaluated, skipped = st.session_state["model"].evaluate(
-                        eval_words, use_unigram_fallback=use_fallback,
+                        eval_words, use_unigram_fallback=use_fallback, smoothing=cur_smoothing,
                     )
                     st.session_state["eval_results"] = {
                         "perplexity": perplexity,
@@ -493,9 +672,9 @@ def evaluation_section():
         if "error" in r:
             st.error(r["error"])
         else:
-            method_label = {"none": "None",
-                            "mle-backoff": "MLE Backoff (with Unigram Fallback)"}.get(
-                                r.get("smoothing_used", "none"), r.get("smoothing_used", "?"))
+            method_label = {"mle-backoff": "None (MLE Backoff with Unigram Fallback)",
+                            "katz": "Katz Backoff (Good-Turing Discounting)"}.get(
+                                r.get("smoothing_used", "mle-backoff"), r.get("smoothing_used", "?"))
             st.success(f"Evaluation complete — Smoothing: **{method_label}**")
             m1, m2, m3 = st.columns(3)
             m1.metric("Perplexity", f"{r['perplexity']:.2f}")
@@ -529,9 +708,10 @@ def prediction_section():
     st.subheader("Suggested Next Words")
 
     if "model" in st.session_state and user_text.strip():
-        use_fallback = st.session_state.get("smoothing", "none") == "mle-backoff"
+        cur_smoothing = st.session_state.get("smoothing", "mle-backoff")
+        use_fallback = cur_smoothing == "mle-backoff"
         predictions = st.session_state["model"].predict(
-            user_text, top_k=5, use_unigram_fallback=use_fallback,
+            user_text, top_k=5, use_unigram_fallback=use_fallback, smoothing=cur_smoothing,
         )
 
         if predictions:

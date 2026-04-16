@@ -12,7 +12,7 @@ This application uses n-gram language modeling to predict the next word based on
 - **Real-time Updates**: Predictions update live as you type (no Enter key needed)
 - **Click-to-Insert**: Click any suggestion button to insert the word
 - **Configurable N-gram Order**: Set n-gram order from 2 to 10 (default: 4)
-- **Smoothing**: Choose from None (MLE without unigram) or MLE Backoff with Unigram Fallback — configurable from the GUI and `config/.env`
+- **Smoothing**: Choose from None (MLE Backoff with Unigram Fallback, default) or Katz Backoff with Good-Turing Discounting — configurable from the GUI and `config/.env`
 - **Custom Book Selection**: Choose up to 100 specific Gutenberg books by ID
 - **Dynamic UI**: Book ID inputs arranged in rows of 10, adapting to the number selected
 - **Model Evaluation**: Compute perplexity against any Gutenberg book to measure model quality
@@ -53,7 +53,7 @@ streamlit run N-gram_streamlit.py
 ### Step 2: Select Smoothing
 
 1. After the model is built, a **Smoothing Method** dropdown appears
-2. Choose **None** (pure MLE backoff) or **MLE Backoff** (with unigram fallback)
+2. Choose **None** (MLE backoff with unigram fallback, default) or **Katz Backoff** (Good-Turing discounting)
 3. Smoothing applies to both predictions and evaluation — change it anytime without rebuilding
 
 ### Step 3: Start Typing
@@ -64,7 +64,7 @@ streamlit run N-gram_streamlit.py
 ### Step 4: Use Predictions
 
 1. As you type, 5 buttons below show suggested next words
-2. With MLE Backoff, if fewer than 5 n-gram matches exist, remaining slots are filled with top unigram words
+2. With MLE Backoff (None), if fewer than 5 n-gram matches exist, remaining slots are filled with top unigram words
 3. Click any button to insert that word into your text
 4. The app automatically handles spacing
 5. Continue typing or clicking suggestions to build your text
@@ -94,8 +94,8 @@ streamlit run N-gram_streamlit.py
 - **Load Books & Build Model**: Downloads books and builds the model in one step
 
 ### Smoothing Method (appears after model is built)
-- **None**: Pure MLE backoff from n-gram down to 2-gram; returns empty if no context matches
-- **MLE Backoff**: Falls back to unigram probabilities when no higher-order context is found; also fills remaining suggestion slots (up to 5) with top unigram words
+- **None**: MLE backoff from n-gram down to 2-gram with unigram fallback; fills remaining suggestion slots (up to 5) with top unigram words (default)
+- **Katz Backoff**: Applies Good-Turing discounting to n-gram counts and redistributes the saved probability mass to lower-order models via proper backoff weights; always produces a probability for every word
 - Change anytime without rebuilding the model — applies to both predictions and evaluation
 
 ### Progress Area
@@ -116,7 +116,7 @@ streamlit run N-gram_streamlit.py
 
 ### Suggested Next Words
 - 5 buttons showing most likely next words
-- With MLE Backoff, unfilled slots are supplemented with top unigram words
+- With None smoothing, unfilled slots are supplemented with top unigram words
 - Click any button to insert that word
 
 ## Technical Details
@@ -127,7 +127,7 @@ streamlit run N-gram_streamlit.py
 2. **Text Extraction**: Downloads and extracts plain text from books using BeautifulSoup
 3. **N-gram Building**: Creates statistical models from 2-grams up to the configured n-gram order
 4. **Context Indexing**: Builds fast lookup dictionaries (converted from defaultdict to dict) for instant predictions
-5. **Prediction**: Uses backoff — tries the highest n-gram context first, then falls back to lower orders. With MLE Backoff, supplements partial results with unigram probabilities to always show up to 5 suggestions
+5. **Prediction**: Uses backoff — tries the highest n-gram context first, then falls back to lower orders. With None smoothing (MLE Backoff), supplements partial results with unigram probabilities to always show up to 5 suggestions
 6. **Evaluation**: Computes perplexity on a held-out book using the same backoff strategy
 
 ### N-gram Sizes (default order = 4)
